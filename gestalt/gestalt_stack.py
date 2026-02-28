@@ -89,7 +89,8 @@ class GestaltStack(Stack):
         )
 
         # Give the machine permission to write to your new Staging Bucket
-        staging_bucket.grant_write(scraper_task.task_role)
+        # This automatically grants s3:ListBucket, s3:GetObject, and s3:PutObject
+        staging_bucket.grant_read_write(scraper_task.task_role)
 
         # 5. The Container Definition
         # This tells CDK to look in your "scraper" folder, build the Dockerfile it finds there,

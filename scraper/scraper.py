@@ -4,6 +4,7 @@ from playwright_stealth import Stealth  # <-- Import the new Stealth class
 from urllib.parse import urljoin, urlparse
 import requests
 #import the time module to add delays between requests
+import json
 import time
 import os
 import boto3
@@ -12,23 +13,103 @@ import random
 
 BASE_URL = 'https://www.justice.gov/epstein/doj-disclosures'
 DOWNLOAD_DIR = "/tmp"
+STATE_FILE = "scraper_state.json"
+BAD_PAGE_FILE = "bad_pages.json"
 LOG_FILE = "playwright_scraper_log.txt"
 cur_dataset_index = 0
 cur_dataset_page = 0
 cur_doc_index = 0
 
-#should start on dataset 1, page 20, EFTA00000990.pdf
+#should start on dataset 10, page 20, EFTA00000990.pdf
 start_dataset_index = 10
-start_dataset_page = 1257
+start_dataset_page = 2208
 start_doc_index = 0
 started = False
 
-# 1. Initialize AWS S3 Client
-# (Fargate automatically injects the IAM credentials, so no keys needed here)
-s3 = boto3.client('s3')
+# Set these to integers to force the scraper to start at a specific location, ignoring the saved state file. 
+# Set them to None to rely on the saved state.
+FORCE_DATASET_INDEX = None  # e.g., 10
+FORCE_DATASET_PAGE = None   # e.g., 1257
 
-# 2. Grab the bucket name injected by our CDK stack
+# 1. Grab the bucket name injected by our CDK stack
 STAGING_BUCKET = os.environ.get('STAGING_BUCKET')
+
+# 2. Environment-Aware Setup
+if STAGING_BUCKET:
+    print(f"Running in CLOUD MODE. Destination: S3 Bucket '{STAGING_BUCKET}'")
+    s3 = boto3.client('s3')
+    DOWNLOAD_DIR = "/tmp"  # Ephemeral storage for Fargate
+else:
+    print("Running in LOCAL MODE. Destination: Local Disk")
+    s3 = None
+    DOWNLOAD_DIR = "D:/development/datasets/Epstein_DOJ_Files"
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# --- STATE MANAGEMENT ---
+def load_state():
+    global start_dataset_index, start_dataset_page, start_doc_index
+    state = {"dataset_index": 0, "dataset_page": 0, "doc_index": 0}
+
+    try:
+        # Try to pull the latest state from S3 if in cloud mode
+        if STAGING_BUCKET:
+            try:
+                s3.download_file(STAGING_BUCKET, STATE_FILE, os.path.join(DOWNLOAD_DIR, STATE_FILE))
+                print(f"Downloaded state file from S3: {STATE_FILE}")
+            except Exception as e:
+                print(f"Failed to download state file from S3: {STATE_FILE}")
+                print(f"Exception: {e}")
+                pass # Normal if it's the very first run
+
+        if os.path.exists(os.path.join(DOWNLOAD_DIR, STATE_FILE)):
+            with open(os.path.join(DOWNLOAD_DIR, STATE_FILE), 'r') as f:
+                state = json.load(f)
+            print(f"Loaded saved state: {state}")
+        else:
+            print("No saved state found. Starting fresh.")
+
+    except Exception as e:
+        print(f"Error loading state: {e}. Starting fresh.")
+
+    # Apply Overrides
+    start_dataset_index = FORCE_DATASET_INDEX if FORCE_DATASET_INDEX is not None else state.get("dataset_index", 0)
+    start_dataset_page = FORCE_DATASET_PAGE if FORCE_DATASET_PAGE is not None else state.get("dataset_page", 0)
+    start_doc_index = state.get("doc_index", 0)
+
+    if FORCE_DATASET_INDEX is not None or FORCE_DATASET_PAGE is not None:
+        print(f"OVERRIDE ENGAGED: Forcing start at Dataset {start_dataset_index}, Page {start_dataset_page}")
+
+def save_state(d_idx, p_idx, doc_idx):
+    state = {
+        "dataset_index": d_idx,
+        "dataset_page": p_idx,
+        "doc_index": doc_idx
+    }
+    try:
+        with open(os.path.join(DOWNLOAD_DIR, STATE_FILE), 'w') as f:
+            json.dump(state, f)
+
+        if STAGING_BUCKET:
+            s3.upload_file(os.path.join(DOWNLOAD_DIR, STATE_FILE), STAGING_BUCKET, STATE_FILE)
+        print(f"--> State Saved: Dataset {d_idx}, Page {p_idx}")
+    except Exception as e:
+        print(f"Failed to save state: {e}")
+
+def save_bad_page(d_idx, p_idx, doc_ids, dataset_url):
+    bad_page_info = {
+        "dataset_index": d_idx,
+        "dataset_page": p_idx,
+        "doc_ids": doc_ids,
+        "dataset_url": dataset_url
+    }
+    try:
+        bad_file_path = os.path.join(DOWNLOAD_DIR, BAD_PAGE_FILE)
+        # open this as append so we keep a running log of all bad pages instead of overwriting
+        with open(bad_file_path, 'a') as f:
+            f.write(json.dumps(bad_page_info) + "\n")
+        print(f"--> Logged bad page: Dataset {d_idx}, Page {p_idx}, URL: {dataset_url}")
+    except Exception as e:
+        print(f"Failed to log bad page: {e}")
 
 def check_for_robot_check(page):
     try:
@@ -125,25 +206,29 @@ def navigate_to_next_page(page):
         return False
 
 def download_pdf(page, pdf_url):
+    global cur_doc_index
     cookies = page.context.cookies()
     session_cookies = {cookie['name']: cookie['value'] for cookie in cookies}
     user_agent = page.evaluate("navigator.userAgent")
     headers = {'User-Agent': user_agent}
 
+    parsed_url = urlparse(pdf_url)
+    filename = os.path.basename(parsed_url.path)
+    if not filename:
+        filename = f'unknown_document_{cur_doc_index}.pdf'
+
+    file_path = os.path.join(DOWNLOAD_DIR, filename)
     try:
+        # 1. Download the file locally
         with requests.get(pdf_url, headers=headers, cookies=session_cookies, stream=True, timeout=30) as response:
             response.raise_for_status()
-            parsed_url = urlparse(pdf_url)
-            filename = os.path.basename(parsed_url.path)
-            if not filename:
-                filename = 'unknown_document.pdf'
-            file_path = os.path.join(DOWNLOAD_DIR, filename)
             with open(file_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-            print(f"Downloaded locally PDF: {file_path}")
+        print(f"Downloaded PDF to: {file_path}")
 
-            # move to S3 bucket
+        # 2. Environment-Aware Storage Handling
+        if STAGING_BUCKET:
             try:
                 print(f"  -> Pushing {filename} to S3 Staging Bucket...")   
                 s3.upload_file(file_path, STAGING_BUCKET, filename)
@@ -151,75 +236,131 @@ def download_pdf(page, pdf_url):
             except Exception as e:
                 print(f"  -> ERROR: Failed to upload {filename} to S3: {str(e)}")
             finally:
-                # CRITICAL: Always clean up the container's disk space
+                # CRITICAL for Fargate: Clean up ephemeral disk space
                 if os.path.exists(file_path):
                     os.remove(file_path)
+        else:
+            # Local mode: leave the file exactly where it is
+            print(f"  -> LOCAL MODE: File retained on disk.")
+
     except requests.exceptions.RequestException as e:
         print(f"Failed to download PDF: {pdf_url} with error {e}")
-        
 
-def select_page(page, page_index):
-    check_for_robot_check(page)  # Check for robot check on the initial page load 
-    check_for_age_gate(page)  # Check for age gate on the initial page load
-    for _ in range(page_index):  # Try up to 10 times to find the page button
+def fast_forward_to_page(page, base_dataset_url, target_page_index):
+    print(f"Fast-forwarding to page {target_page_index} using the hybrid click-then-jump method...")
+
+    # If the target page is very close, it's faster/safer to just click there
+    if target_page_index <= 3:
+        for _ in range(target_page_index):
+            navigate_to_next_page(page)
+        return
+
+    # Step 1: Establish human trust by clicking Next 3 times
+    print("Performing 3 humanized clicks to build Akamai trust score...")
+    for i in range(3):
+        print(f" -> Trust-building click {i+1}/3...")
         navigate_to_next_page(page)
+        # Add a slightly longer delay between these specific clicks to ensure telemetry is sent
+        time.sleep(random.uniform(1.5, 2.5))
 
-def process_dataset_page(page, dataset_url):
-    global started
-    global start_dataset_page
-    global start_doc_index
+    # Step 2: Jump directly to the target URL
+    # Handle whether the base URL already has query parameters
+    target_url = base_dataset_url
+    if "?" in target_url:
+        target_url += f"&page={target_page_index}"
+    else:
+        target_url += f"?page={target_page_index}"
+
+    print(f"Trust established. Jumping directly to: {target_url}")
+
+    # Add a human-like pause before manually modifying the URL bar
+    time.sleep(random.uniform(2.0, 3.5))
+
+    page.goto(target_url)
+    page.wait_for_load_state('networkidle')
+    print("Successfully jumped to target page!")
+
+
+def process_dataset_page(page, dataset_url, is_resume_dataset=False):
+    global started, start_dataset_page, start_doc_index
+    global cur_dataset_page, cur_doc_index
+
     print(f"Navigating to dataset page: {dataset_url}")
     cur_dataset_page = 0
     page.goto(dataset_url)
-    page.wait_for_load_state('networkidle')  # Wait for the page to load
+    page.wait_for_load_state('networkidle')
 
-    if start_dataset_page > 0 and not started:
-        print(f"Starting from page {start_dataset_page} of the dataset...")
-        select_page(page, start_dataset_page)
+    # --- THE NEW FAST-FORWARD LOGIC ---
+    if is_resume_dataset and start_dataset_page - 1 > 0:
+        fast_forward_to_page(page, dataset_url, start_dataset_page - 1)
+        # CRITICAL: Update our tracker so the script knows we jumped!
+        cur_dataset_page = start_dataset_page 
 
-    #get the list of PDF links on the dataset page
+    # Get the list of PDF links on the dataset page
     while True:
-        check_for_robot_check(page)  # Check for robot check on the initial page load 
-        check_for_age_gate(page)  # Check for age gate on the initial page load
+        check_for_robot_check(page)
+        check_for_age_gate(page)
         pdf_links = page.locator('a[href$=".pdf"]').all()
         pdf_hrefs = [link.get_attribute('href') for link in pdf_links]
-        # TODO if not started, check the index of the current document and only process the ones that are after the current document index
+        
         pdf_hrefs_to_process = pdf_hrefs
-        if start_doc_index > 0 and not started:
+
+        # If we are resuming, slice off the documents we already downloaded on this specific page
+        if is_resume_dataset and not started and start_doc_index > 0:
             pdf_hrefs_to_process = pdf_hrefs[start_doc_index:]
+
+        # The moment we process our first batch of links, we are officially fully caught up.
         started = True
-        print(f"pdf_hrefs is {pdf_hrefs_to_process}")
-        print(f"pdf_links is {pdf_links}")
+
         if len(pdf_hrefs) == 0:
-            page.screenshot(path="/tmp/debug_state.png")
-            s3.upload_file("/tmp/debug_state.png", STAGING_BUCKET, "debug_state.png")
-        for pdf_href in pdf_hrefs_to_process:
+            screenshot_path = os.path.join(DOWNLOAD_DIR, f"debug_state_{cur_dataset_index}_page_{cur_dataset_page}.png")
+            page.screenshot(path=screenshot_path, full_page=True)
+            print("No PDFs found on this page. Taking debug screenshot...")
+            print("No PDFs found on this page. Saving debug info locally...")
+            save_bad_page(cur_dataset_index, cur_dataset_page, [], dataset_url)
+            if STAGING_BUCKET:
+                s3.upload_file(screenshot_path, STAGING_BUCKET, f"debug_state_{cur_dataset_index}_page_{cur_dataset_page}.png")
+
+        for i, pdf_href in enumerate(pdf_hrefs_to_process):
             full_pdf_url = urljoin(dataset_url, pdf_href)
-            try:
-                cur_doc_index = pdf_hrefs.index(pdf_href)
-                download_pdf(page, full_pdf_url)
-            except Exception as e:
-                print(f"Error downloading PDF: {full_pdf_url}, Error: {e}")
-            print(f"Found PDF link: {full_pdf_url}")
+
+            # Keep global track of where we are on the current page for logging/errors
+            # If we sliced the array, we need to add the offset back to get the real index
+            cur_doc_index = i if start_doc_index == 0 else (i + start_doc_index)
+
+            print(f"Processing PDF {cur_doc_index}: {full_pdf_url}")
+            download_pdf(page, full_pdf_url)
+
+        # Reset doc index to 0 for the next page
+        start_doc_index = 0 
+
         if not navigate_to_next_page(page):
+            save_state(cur_dataset_index + 2, 0, 0)
             break
         else:
             cur_dataset_page += 1
-    return
+            save_state(cur_dataset_index + 1, cur_dataset_page, 0)
+
 
 def loop_through_datasets(page, dataset_links):
-    global started
-    global start_dataset_index
-    # TODO if not started, check the index of the current dataset and only process the ones that are after the current dataset index
-    if start_dataset_index > 0 and not started:
-        dataset_links = dataset_links[start_dataset_index:]
-    for link in dataset_links:
-        print(f"Processing dataset link: {link}")
-        cur_dataset_index = dataset_links.index(link)
-        process_dataset_page(page, urljoin(BASE_URL, link))
-        # Here you can add logic to download PDFs or extract information from the dataset page
+    global started, start_dataset_index, cur_dataset_index
+
+    # Use enumerate to keep the real index even if we skip items
+    for i, link in enumerate(dataset_links):
+        cur_dataset_index = i
+
+        if not started and i < start_dataset_index - 1:
+            print(f"Skipping dataset {i}: {link}")
+            continue
+
+        print(f"Processing dataset {i}: {link}")
+
+        # Pass a flag so the page processor knows if it needs to click the 'Next' button to catch up
+        is_resume_target = (not started and i == start_dataset_index - 1)
+        process_dataset_page(page, urljoin(BASE_URL, link), is_resume_dataset=is_resume_target)
 
 def run():
+    load_state()
     with Stealth().use_sync(sync_playwright()) as p:
         browser = p.chromium.launch(headless=True)  # Set headless=True to run without opening a browser window
         context = browser.new_context( 
@@ -231,7 +372,7 @@ def run():
         page.goto(BASE_URL)
         page.wait_for_load_state('networkidle')  # Wait for the page to load completely
         page.wait_for_timeout(2000)  # Wait for 2 seconds to ensure the page is fully loaded
-        
+
         navigate_to_datasets(page)
         dataset_links = list_dataset_links(page)
         print("Found PDF links:", dataset_links)
@@ -240,6 +381,5 @@ def run():
 
 if __name__ == "__main__":
     if not STAGING_BUCKET:
-        print("CRITICAL ERROR: STAGING_BUCKET environment variable missing.")
-        exit(1)
+        print("WARNING: STAGING_BUCKET environment variable missing. Defaulting to LOCAL storage.")
     run()
